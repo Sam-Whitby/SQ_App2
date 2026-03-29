@@ -5,6 +5,7 @@ Scrolling grand-staff display for MIDI input (file playback or live keyboard).
 Notes drift from right to left; the vertical red "play line" marks when to play.
 """
 
+import math
 import pygame
 import mido
 import sys
@@ -15,14 +16,18 @@ import subprocess
 import platform
 from typing import List, Optional
 
-# ── Live MIDI (python-rtmidi) ─────────────────────────────────────────────────
+try:
+    import pygame.gfxdraw
+    HAS_GFXDRAW = True
+except ImportError:
+    HAS_GFXDRAW = False
+
 try:
     import rtmidi as _rtmidi
     HAS_RTMIDI = True
 except ImportError:
     HAS_RTMIDI = False
 
-# ── Resource path (works both in dev and PyInstaller bundle) ──────────────────
 def _res(rel: str) -> str:
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, rel)
@@ -33,45 +38,56 @@ def _res(rel: str) -> str:
 # ║  LAYOUT & COLOURS                                                           ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-W, H  = 1440, 800
-FPS   = 60
+W, H   = 1440, 820
+FPS    = 60
 
-LINE_SP  = 15      # pixels between adjacent staff lines
-NOTE_R   = 10      # horizontal radius of note-head ellipse
-NOTE_H   = 7       # vertical radius of note-head ellipse
-TAIL_H   = 5       # tail height in pixels
-PLAY_X   = 210     # x-position of the play line
-CLEF_W   = PLAY_X  # clef strip is [0 .. PLAY_X]
+# Staff geometry — all derived from LINE_SP so everything scales together
+LINE_SP  = 16        # pixels between adjacent staff lines
+STAFF_H  = 4 * LINE_SP          # height of a 5-line staff (top to bottom line)
+GAP      = 2 * LINE_SP          # gap between bottom of treble and top of bass
+                                 # (middle C sits in the centre of this gap)
 
-TREBLE_TOP = 115   # y of top staff line of treble (F5)
-BASS_TOP   = 420   # y of top staff line of bass   (A3)
+# Vertical placement — centre the grand staff in the music area
+MUSIC_H  = H - 140              # music area height (above controls)
+GRAND_H  = STAFF_H * 2 + GAP   # full height of grand staff
+TREBLE_TOP = (MUSIC_H - GRAND_H) // 2 + 10   # y of F5 (treble top line)
+BASS_TOP   = TREBLE_TOP + STAFF_H + GAP       # y of A3 (bass top line)
 
-CTRL_Y   = H - 130  # top of control strip
+# Note dimensions
+NOTE_W   = round(LINE_SP * 0.70)   # horizontal radius of note-head
+NOTE_H_R = round(LINE_SP * 0.45)   # vertical radius of note-head
+TAIL_T   = max(3, round(LINE_SP * 0.22))   # tail thickness
 
-# colours
-BG       = (248, 245, 238)
-STAVE_C  = ( 20,  20,  20)
-CLEF_BG  = (230, 226, 214)
-PLAY_C   = (210,  40,  40)
-NOTE_FUT = ( 30,  70, 185)
-NOTE_NOW = (220,  50,  20)
-NOTE_PAS = (145, 145, 145)
-TAIL_C   = ( 80, 120, 215)
-CTRL_BG  = (215, 212, 204)
-DARK     = ( 55,  55,  55)
-LGRAY    = (170, 170, 170)
-BLUE     = ( 50,  90, 205)
-LBLUE    = (110, 150, 245)
-WHITE    = (255, 255, 255)
+PLAY_X   = 210          # x of play line
+CLEF_W   = PLAY_X       # clef strip [0 .. PLAY_X]
+CTRL_Y   = H - 140      # top of control strip
+
+# Colours — music elements are all pure black on a light background
 BLACK    = (  0,   0,   0)
-BRACE_C  = ( 30,  30,  30)
+WHITE    = (255, 255, 255)
+BG       = (252, 250, 245)   # slightly warm white
+CLEF_BG  = (238, 235, 226)
+STAFF_C  = BLACK
+NOTE_C   = BLACK
+TAIL_C   = BLACK
+LEDGER_C = BLACK
+ACC_C    = BLACK
+PLAY_C   = (200,  30,  30)   # red play line
+
+# UI colours
+CTRL_BG  = (215, 212, 205)
+DARK     = ( 50,  50,  50)
+LGRAY    = (165, 165, 165)
+BLUE     = ( 45,  90, 205)
+LBLUE    = (110, 148, 245)
+BRACE_C  = BLACK
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  PITCH UTILITIES                                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
-# Chromatic pitch-class → (diatonic degree 0-6, accidental '#'/None)
+# Chromatic pitch-class → (diatonic degree 0-6, accidental '#' or None)
 _C2D = {
     0:(0,None), 1:(0,'#'), 2:(1,None), 3:(1,'#'), 4:(2,None),
     5:(3,None), 6:(3,'#'), 7:(4,None), 8:(4,'#'), 9:(5,None),
@@ -85,19 +101,90 @@ def _dia(midi: int) -> int:
 def _acc(midi: int) -> Optional[str]:
     return _C2D[midi % 12][1]
 
-# Diatonic step of each clef's top staff line
-_TREF = _dia(77)  # F5 — treble top
-_BREF = _dia(57)  # A3 — bass   top
+_TREF = _dia(77)   # F5 — treble top line
+_BREF = _dia(57)   # A3 — bass   top line
 
 def note_y(midi: int, clef: str) -> float:
-    """Centre-y of a note on its staff (in pixels)."""
+    """Centre-y of a note on its staff, in pixels."""
     top = TREBLE_TOP if clef == 'treble' else BASS_TOP
     ref = _TREF      if clef == 'treble' else _BREF
     return top + (ref - _dia(midi)) * (LINE_SP / 2)
 
 def use_treble(midi: int) -> bool:
-    """Notes >= C4 (MIDI 60) go on the treble staff."""
     return midi >= 60
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PRE-RENDERED ACCIDENTAL SURFACES                                           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+def _make_sharp(lsp: int) -> pygame.Surface:
+    """Render a ♯ symbol into a transparent surface."""
+    sw = round(lsp * 0.95)
+    sh = round(lsp * 1.65)
+    surf = pygame.Surface((sw, sh), pygame.SRCALPHA)
+
+    x1 = round(sw * 0.30)
+    x2 = round(sw * 0.70)
+
+    # vertical lines (full height)
+    pygame.draw.line(surf, BLACK, (x1, 0), (x1, sh - 1), 1)
+    pygame.draw.line(surf, BLACK, (x2, 0), (x2, sh - 1), 1)
+
+    # two horizontal bars (slightly angled: rises left to right)
+    by1 = round(sh * 0.30)
+    by2 = round(sh * 0.62)
+    bar_w = sw - 1
+    slope = 2  # pixels of rise across full width
+
+    # top bar
+    for dy_px in range(2):   # 2px thick
+        pygame.draw.line(surf, BLACK,
+                         (0,    by1 + 1 + dy_px),
+                         (bar_w, by1 - 1 + dy_px), 1)
+    # bottom bar
+    for dy_px in range(2):
+        pygame.draw.line(surf, BLACK,
+                         (0,    by2 + 1 + dy_px),
+                         (bar_w, by2 - 1 + dy_px), 1)
+    return surf
+
+
+def _make_flat(lsp: int) -> pygame.Surface:
+    """Render a ♭ symbol into a transparent surface."""
+    fw = round(lsp * 0.72)
+    fh = round(lsp * 2.05)
+    surf = pygame.Surface((fw, fh), pygame.SRCALPHA)
+
+    stem_x = round(fw * 0.18)
+
+    # vertical stem
+    pygame.draw.line(surf, BLACK, (stem_x, 0), (stem_x, fh - 1), 1)
+
+    # belly — filled polygon approximating the D-shape
+    belly_top_y  = round(fh * 0.38)
+    belly_bot_y  = round(fh * 0.82)
+    belly_cx     = stem_x
+    belly_rx     = fw - stem_x - 1
+    belly_ry     = (belly_bot_y - belly_top_y) // 2
+    belly_cy     = (belly_top_y + belly_bot_y) // 2
+
+    # Right-facing D: flat left edge at stem_x, curve opening to the right
+    pts = [(stem_x, belly_cy - belly_ry)]
+    for deg in range(-90, 91, 6):
+        rad = deg * math.pi / 180
+        px = stem_x + round(belly_rx * math.cos(rad))
+        py = belly_cy + round(belly_ry * math.sin(rad))
+        pts.append((px, py))
+    pts.append((stem_x, belly_cy + belly_ry))
+
+    if len(pts) >= 3:
+        pygame.draw.polygon(surf, BLACK, pts)
+
+    # re-draw the stem over the polygon to keep it clean
+    pygame.draw.line(surf, BLACK, (stem_x, 0), (stem_x, fh - 1), 1)
+
+    return surf
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -118,11 +205,9 @@ class NoteEvent:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 def load_midi(path: str) -> List[NoteEvent]:
-    """Parse a .mid file into NoteEvents with absolute wall-clock times (seconds)."""
     mid = mido.MidiFile(path)
     tpb = mid.ticks_per_beat
 
-    # Merge all tracks, sort by absolute tick
     raw = []
     for track in mid.tracks:
         t = 0
@@ -132,10 +217,10 @@ def load_midi(path: str) -> List[NoteEvent]:
     raw.sort(key=lambda x: x[0])
 
     notes: List[NoteEvent] = []
-    active = {}      # (ch, note) → NoteEvent
-    cur_tick  = 0
-    cur_sec   = 0.0
-    tempo     = 500_000  # µs per beat (120 BPM default)
+    active = {}
+    cur_tick = 0
+    cur_sec  = 0.0
+    tempo    = 500_000
 
     for abs_tick, msg in raw:
         delta = abs_tick - cur_tick
@@ -147,7 +232,7 @@ def load_midi(path: str) -> List[NoteEvent]:
             tempo = msg.tempo
         elif msg.type == 'note_on' and msg.velocity > 0:
             k = (msg.channel, msg.note)
-            if k in active:           # re-trigger: close old note
+            if k in active:
                 active[k].end = cur_sec
             ne = NoteEvent(msg.note, cur_sec, msg.velocity)
             active[k] = ne
@@ -158,7 +243,7 @@ def load_midi(path: str) -> List[NoteEvent]:
                 active[k].end = cur_sec
                 del active[k]
 
-    for ne in active.values():        # close any unterminated notes
+    for ne in active.values():
         ne.end = ne.start + 0.5
 
     return notes
@@ -233,7 +318,6 @@ class LiveInput:
             return list(self.notes)
 
     def prune(self, before: float):
-        """Discard notes that ended well before `before`."""
         with self._lock:
             self.notes = [n for n in self.notes
                           if n.end is None or n.end > before]
@@ -244,24 +328,23 @@ class LiveInput:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 class Slider:
-    def __init__(self, x: int, y: int, w: int,
-                 mn: float, mx: float, val: float, label: str):
+    def __init__(self, x, y, w, mn, mx, val, label):
         self.x, self.y, self.w = x, y, w
         self.mn, self.mx = mn, mx
         self.val   = val
         self.label = label
         self._drag = False
 
-    def _frac(self) -> float:
+    def _frac(self):
         return (self.val - self.mn) / (self.mx - self.mn)
 
     @property
-    def hx(self) -> int:
+    def hx(self):
         return int(self.x + self._frac() * self.w)
 
     def handle(self, ev):
-        tr = pygame.Rect(self.x, self.y - 4, self.w, 8)
-        hh = pygame.Rect(self.hx - 10, self.y - 13, 20, 26)
+        tr = pygame.Rect(self.x, self.y - 5, self.w, 10)
+        hh = pygame.Rect(self.hx - 11, self.y - 14, 22, 28)
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             if hh.collidepoint(ev.pos) or tr.collidepoint(ev.pos):
                 self._drag = True
@@ -271,28 +354,25 @@ class Slider:
         elif ev.type == pygame.MOUSEMOTION and self._drag:
             self._move(ev.pos[0])
 
-    def _move(self, mx: int):
+    def _move(self, mx):
         f = max(0.0, min(1.0, (mx - self.x) / self.w))
         self.val = self.mn + f * (self.mx - self.mn)
 
     def draw(self, surf, font):
-        # track
         tr = pygame.Rect(self.x, self.y - 4, self.w, 8)
         pygame.draw.rect(surf, LGRAY, tr, border_radius=4)
-        pygame.draw.rect(surf, BLUE, pygame.Rect(self.x, self.y - 4,
-                          self.hx - self.x, 8), border_radius=4)
-        # handle
+        pygame.draw.rect(surf, BLUE,
+                         pygame.Rect(self.x, self.y - 4, self.hx - self.x, 8),
+                         border_radius=4)
         col = LBLUE if self._drag else BLUE
-        pygame.draw.rect(surf, col,   (self.hx-10, self.y-13, 20, 26), border_radius=5)
-        pygame.draw.rect(surf, DARK,  (self.hx-10, self.y-13, 20, 26), 1, border_radius=5)
-        # label
+        pygame.draw.rect(surf, col,  (self.hx - 11, self.y - 14, 22, 28), border_radius=5)
+        pygame.draw.rect(surf, DARK, (self.hx - 11, self.y - 14, 22, 28), 1, border_radius=5)
         lbl = font.render(f'{self.label}: {self.val:.1f}s', True, DARK)
-        surf.blit(lbl, (self.x, self.y - 34))
+        surf.blit(lbl, (self.x, self.y - 35))
 
 
 class Button:
-    def __init__(self, x: int, y: int, w: int, h: int,
-                 text: str, sticky: bool = False):
+    def __init__(self, x, y, w, h, text, sticky=False):
         self.rect    = pygame.Rect(x, y, w, h)
         self.text    = text
         self.sticky  = sticky
@@ -331,42 +411,101 @@ class App:
         pygame.display.set_caption('MIDI Staff Visualizer')
         self.clock = pygame.time.Clock()
 
-        # ── fonts ─────────────────────────────────────────────────────────────
-        self.uf  = pygame.font.SysFont('Arial', 18)
-        self.sf  = pygame.font.SysFont('Arial', 14)
-        self.cf  = self._find_music_font(82)   # for clef glyphs
-        self.af  = self._find_acc_font(24)     # ♯ ♭
+        # UI fonts
+        self.uf = pygame.font.SysFont('Arial', 18)
+        self.sf = pygame.font.SysFont('Arial', 14)
 
-        # ── state ─────────────────────────────────────────────────────────────
-        self.mode: str = 'file'
+        # Clef font — needs Unicode Musical Symbols support
+        self.cf = self._find_music_font(86)
+
+        # Pre-render accidental symbols
+        self._sharp_surf = _make_sharp(LINE_SP)
+        self._flat_surf  = _make_flat(LINE_SP)
+
+        # App state
+        self.mode      = 'file'
         self.notes: List[NoteEvent] = []
-        self.cur_t:  float = 0.0
-        self._wall0: Optional[float] = None
-        self.playing = False
-        self.file_path: Optional[str] = None
-        self.status = 'Load a MIDI file, or switch to Live mode'
+        self.cur_t     = 0.0
+        self._wall0    = None
+        self.playing   = False
+        self.file_path = None
+        self.status    = 'Load a MIDI file, or switch to Live mode'
         self._dialog_open = False
 
-        self.live    = LiveInput()
-        self._live_t0: Optional[float] = None
+        self.live      = LiveInput()
+        self._live_t0  = None
 
-        # ── widgets ───────────────────────────────────────────────────────────
+        # Widgets
         BY = CTRL_Y + 18
-        self.btn_mode = Button( 20, BY,      145, 38, 'Mode: File', sticky=True)
-        self.btn_load = Button( 20, BY + 50, 145, 30, 'Load File...')
-        self.btn_play = Button(180, BY,       80, 38, 'Play')
-        self.btn_stop = Button(272, BY,       80, 38, 'Stop')
-        self.sld = Slider(420, BY + 26, 340, 0.5, 10.0, 4.0, 'Lookahead')
+        self.btn_mode = Button( 20, BY,       145, 38, 'Mode: File', sticky=True)
+        self.btn_load = Button( 20, BY + 50,  145, 30, 'Load File...')
+        self.btn_play = Button(180, BY,        80, 38, 'Play')
+        self.btn_stop = Button(272, BY,        80, 38, 'Stop')
+        self.sld      = Slider(420, BY + 26,  340,  0.5, 10.0, 4.0, 'Lookahead')
 
-        # auto-load bundled valse
+        # Pre-build static staff surface (background lines don't change)
+        self._staff_surf = self._build_staff_surface()
+
+        # Auto-load demo
         default = _res('valse_69_1_(c)dery.mid')
         if os.path.exists(default):
             self._load(default)
 
+    # ── static staff background ───────────────────────────────────────────────
+
+    def _build_staff_surface(self) -> pygame.Surface:
+        """Render the fixed background (staves, clef strip, clefs, brace) once."""
+        surf = pygame.Surface((W, H))
+        surf.fill(BG)
+
+        # Clef area background
+        top_y0 = TREBLE_TOP - 3 * LINE_SP
+        bot_y1 = BASS_TOP   + STAFF_H + 3 * LINE_SP
+        pygame.draw.rect(surf, CLEF_BG, (0, top_y0, CLEF_W, bot_y1 - top_y0))
+
+        # Draw both staves across full width
+        for top_y in (TREBLE_TOP, BASS_TOP):
+            for i in range(5):
+                y = top_y + i * LINE_SP
+                pygame.draw.line(surf, STAFF_C, (CLEF_W, y), (W - 10, y), 1)
+
+        # Dividing line between clef strip and scroll area
+        pygame.draw.line(surf, (180, 178, 168),
+                         (CLEF_W, top_y0), (CLEF_W, bot_y1), 1)
+
+        # Clef symbols
+        if self.cf:
+            tc = self.cf.render('𝄞', True, BLACK)
+            bc = self.cf.render('𝄢', True, BLACK)
+            # Treble: align so curl is on G4 (2nd line from bottom)
+            surf.blit(tc, (CLEF_W - tc.get_width() - 4,
+                           TREBLE_TOP - round(LINE_SP * 2.0)))
+            # Bass: align so dots straddle F3 (2nd line from top)
+            surf.blit(bc, (CLEF_W - bc.get_width() - 4,
+                           BASS_TOP - round(LINE_SP * 0.6)))
+        else:
+            f = pygame.font.SysFont('serif', 52)
+            surf.blit(f.render('G', True, BLACK), (CLEF_W - 50, TREBLE_TOP - 8))
+            surf.blit(f.render('F', True, BLACK), (CLEF_W - 50, BASS_TOP - 8))
+
+        # Brace — vertical bar with serifs connecting both staves
+        y0 = TREBLE_TOP
+        y1 = BASS_TOP + STAFF_H
+        bx = 10
+        pygame.draw.line(surf, BRACE_C, (bx, y0), (bx, y1), 3)
+        pygame.draw.line(surf, BRACE_C, (bx, y0), (bx + 12, y0), 3)
+        pygame.draw.line(surf, BRACE_C, (bx, y1), (bx + 12, y1), 3)
+
+        # Left barline spanning both staves
+        pygame.draw.line(surf, STAFF_C,
+                         (CLEF_W, TREBLE_TOP),
+                         (CLEF_W, BASS_TOP + STAFF_H), 1)
+
+        return surf
+
     # ── font helpers ──────────────────────────────────────────────────────────
 
     def _find_music_font(self, sz: int):
-        """Return a font that can render the treble/bass clef Unicode chars."""
         for name in ('Apple Symbols', 'FreeSerif', 'DejaVu Serif',
                      'Symbola', 'Arial Unicode MS', None):
             try:
@@ -378,18 +517,6 @@ class App:
                 pass
         return None
 
-    def _find_acc_font(self, sz: int):
-        """Return a font that renders ♯ and ♭."""
-        for name in ('Apple Symbols', 'DejaVu Sans', 'Arial', None):
-            try:
-                f = (pygame.font.SysFont(name, sz) if name
-                     else pygame.font.Font(None, sz))
-                if f.render('♯', True, BLACK).get_width() > 3:
-                    return f
-            except Exception:
-                pass
-        return pygame.font.SysFont(None, sz)
-
     # ── file loading ──────────────────────────────────────────────────────────
 
     def _load(self, path: str):
@@ -399,13 +526,11 @@ class App:
             self.cur_t     = 0.0
             self.playing   = False
             self._wall0    = None
-            fname = os.path.basename(path)
-            self.status = f'Loaded: {fname}  ({len(self.notes)} notes)'
+            self.status    = f'Loaded: {os.path.basename(path)}  ({len(self.notes)} notes)'
         except Exception as e:
-            self.status = f'Error loading file: {e}'
+            self.status = f'Error: {e}'
 
     def _open_dialog(self):
-        """Open a native file-open dialog (non-blocking)."""
         if self._dialog_open:
             return
         self._dialog_open = True
@@ -413,25 +538,21 @@ class App:
         def _run():
             path = None
             if platform.system() == 'Darwin':
-                script = (
-                    'set f to choose file with prompt "Select MIDI file" '
-                    'of type {"mid", "midi", "public.data"}\n'
-                    'return POSIX path of f'
-                )
-                r = subprocess.run(['osascript', '-e', script],
-                                   capture_output=True, text=True)
+                r = subprocess.run(
+                    ['osascript', '-e',
+                     'set f to choose file with prompt "Select MIDI file" '
+                     'of type {"mid","midi","public.data"}\nreturn POSIX path of f'],
+                    capture_output=True, text=True)
                 if r.returncode == 0:
                     path = r.stdout.strip()
             else:
                 try:
                     import tkinter as tk
                     from tkinter import filedialog
-                    root = tk.Tk()
-                    root.withdraw()
+                    root = tk.Tk(); root.withdraw()
                     path = filedialog.askopenfilename(
                         title='Select MIDI File',
-                        filetypes=[('MIDI files', '*.mid *.midi'),
-                                   ('All files', '*.*')])
+                        filetypes=[('MIDI', '*.mid *.midi'), ('All', '*.*')])
                     root.destroy()
                 except Exception:
                     pass
@@ -461,7 +582,7 @@ class App:
         else:
             self.btn_mode.text = 'Mode: File'
             self.live.stop()
-            self.status = ('File loaded — press Play or Space'
+            self.status = ('Press Play or Space'
                            if self.notes else 'Load a MIDI file to begin')
 
     # ── playback ──────────────────────────────────────────────────────────────
@@ -490,41 +611,59 @@ class App:
             self.cur_t = time.time() - self._wall0
             if self.notes:
                 end_t = max((n.end or n.start) for n in self.notes)
-                if self.cur_t > end_t + 2.5:
+                if self.cur_t > end_t + 3.0:
                     self._stop()
         elif self.mode == 'live' and self._live_t0 is not None:
             self.cur_t = time.time() - self._live_t0
-            self.live.prune(self.cur_t - 8.0)
+            self.live.prune(self.cur_t - 10.0)
 
     # ── note drawing ──────────────────────────────────────────────────────────
 
-    def _nx(self, t: float, la: float) -> float:
-        """Convert a note time to screen x-coordinate."""
+    def _note_x(self, t: float, ref_t: float, la: float) -> float:
+        """Screen x for a note at time t, given reference time ref_t and lookahead la."""
         uw = W - PLAY_X - 12
-        return PLAY_X + (t - self.cur_t) * (uw / la)
+        return PLAY_X + (t - ref_t) * (uw / la)
 
-    def _draw_ledger_lines(self, x: float, ny: float, top_y: int):
-        lw = NOTE_R + 7
-        xi = int(x)
-        bot_y = top_y + 4 * LINE_SP
+    def _draw_ledger_lines(self, xi: int, ny: float, top_y: int):
+        """Draw ledger lines above and/or below the staff for note at ny."""
+        bot_y = top_y + STAFF_H
+        lw    = NOTE_W + 7   # ledger line half-width
 
-        # below staff
+        # Below staff: first ledger at bot_y + LINE_SP
         ly = bot_y + LINE_SP
-        while ly <= ny + LINE_SP * 0.45:
-            pygame.draw.line(self.surf, STAVE_C,
+        while ly <= ny + LINE_SP * 0.4:
+            pygame.draw.line(self.surf, LEDGER_C,
                              (xi - lw, round(ly)), (xi + lw, round(ly)), 1)
             ly += LINE_SP
 
-        # above staff
+        # Above staff: first ledger at top_y - LINE_SP
         ly = top_y - LINE_SP
-        while ly >= ny - LINE_SP * 0.45:
-            pygame.draw.line(self.surf, STAVE_C,
+        while ly >= ny - LINE_SP * 0.4:
+            pygame.draw.line(self.surf, LEDGER_C,
                              (xi - lw, round(ly)), (xi + lw, round(ly)), 1)
             ly -= LINE_SP
 
-    def _draw_notes(self, notes: List[NoteEvent], la: float):
-        vis_start = self.cur_t - 3.5
-        vis_end   = self.cur_t + la + 0.6
+    def _draw_note_head(self, xi: int, yi: int):
+        """Draw a filled black ellipse note head with a clean 1-px outline."""
+        r = pygame.Rect(xi - NOTE_W, yi - NOTE_H_R, NOTE_W * 2, NOTE_H_R * 2)
+        if HAS_GFXDRAW:
+            pygame.gfxdraw.filled_ellipse(self.surf, xi, yi, NOTE_W, NOTE_H_R, NOTE_C)
+            pygame.gfxdraw.aaellipse(     self.surf, xi, yi, NOTE_W, NOTE_H_R, NOTE_C)
+        else:
+            pygame.draw.ellipse(self.surf, NOTE_C, r)
+
+    def _draw_notes(self, notes: List[NoteEvent], la: float, is_live: bool = False):
+        """
+        Draw all visible notes.
+
+        In live mode the reference time is shifted back by `la` so that a note
+        played right now enters at the right edge and drifts to the play line
+        over the next `la` seconds — exactly like file mode.
+        """
+        ref_t = (self.cur_t - la) if is_live else self.cur_t
+
+        vis_start = ref_t - 3.0
+        vis_end   = ref_t + la + 0.5
 
         for n in notes:
             end_t = n.end if n.end is not None else self.cur_t
@@ -534,75 +673,38 @@ class App:
             clef  = 'treble' if use_treble(n.pitch) else 'bass'
             top_y = TREBLE_TOP if clef == 'treble' else BASS_TOP
             ny    = note_y(n.pitch, clef)
-            sx    = self._nx(n.start, la)
-            ex    = self._nx(end_t,   la)
+            sx    = self._note_x(n.start, ref_t, la)
+            ex    = self._note_x(end_t,   ref_t, la)
 
-            # ── tail (thick horizontal bar = note duration) ────────────────
-            dsx = max(sx, float(CLEF_W))
-            dex = min(ex, float(W - 12))
-            if dex > dsx:
+            # ── duration tail ─────────────────────────────────────────────
+            # Tail runs from the right edge of the note head to end_x,
+            # clamped to the visible scroll area.
+            tail_x0 = max(sx + NOTE_W, float(CLEF_W))
+            tail_x1 = min(ex,          float(W - 12))
+            if tail_x1 > tail_x0:
                 pygame.draw.rect(
                     self.surf, TAIL_C,
-                    (int(dsx), round(ny) - TAIL_H // 2,
-                     int(dex - dsx), TAIL_H))
+                    (round(tail_x0), round(ny) - TAIL_T // 2,
+                     round(tail_x1 - tail_x0), TAIL_T))
 
-            # ── note head ─────────────────────────────────────────────────
-            if CLEF_W - NOTE_R <= sx <= W:
-                dt  = n.start - self.cur_t
-                col = (NOTE_NOW if abs(dt) < 0.15
-                       else NOTE_PAS if dt < 0
-                       else NOTE_FUT)
-                r = pygame.Rect(int(sx) - NOTE_R,
-                                round(ny) - NOTE_H,
-                                NOTE_R * 2, NOTE_H * 2)
-                pygame.draw.ellipse(self.surf, col,   r)
-                pygame.draw.ellipse(self.surf, BLACK, r, 1)
+            # ── note head (only if within visible area) ───────────────────
+            if CLEF_W - NOTE_W <= sx <= W + NOTE_W:
+                xi = round(sx)
+                yi = round(ny)
 
-                # ledger lines
-                self._draw_ledger_lines(sx, ny, top_y)
+                self._draw_note_head(xi, yi)
+                self._draw_ledger_lines(xi, ny, top_y)
 
-                # accidental (to the left of note head)
+                # ── accidental ────────────────────────────────────────────
                 acc = _acc(n.pitch)
-                if acc and sx > CLEF_W - 35 and self.af:
-                    sym  = '♯' if acc == '#' else '♭'
-                    asurf = self.af.render(sym, True, NOTE_FUT)
-                    self.surf.blit(
-                        asurf,
-                        (int(sx) - NOTE_R - asurf.get_width() - 2,
-                         round(ny) - asurf.get_height() // 2))
-
-    # ── staff drawing ─────────────────────────────────────────────────────────
-
-    def _draw_staff(self, top_y: int):
-        for i in range(5):
-            y = top_y + i * LINE_SP
-            pygame.draw.line(self.surf, STAVE_C, (CLEF_W, y), (W - 12, y), 1)
-
-    def _draw_clefs(self):
-        # Draw clef glyphs if the font supports them
-        if self.cf:
-            tc = self.cf.render('𝄞', True, STAVE_C)
-            bc = self.cf.render('𝄢', True, STAVE_C)
-            # position treble clef so bottom curl sits near E4 (line 1)
-            self.surf.blit(tc, (CLEF_W - tc.get_width() - 6,
-                                TREBLE_TOP - 32))
-            self.surf.blit(bc, (CLEF_W - bc.get_width() - 6,
-                                BASS_TOP - 10))
-        else:
-            f = pygame.font.SysFont('serif', 52)
-            self.surf.blit(f.render('G', True, STAVE_C),
-                           (CLEF_W - 50, TREBLE_TOP - 5))
-            self.surf.blit(f.render('F', True, STAVE_C),
-                           (CLEF_W - 50, BASS_TOP - 5))
-
-    def _draw_brace(self):
-        """Simple square-bracket brace connecting both staves."""
-        y0 = TREBLE_TOP
-        y1 = BASS_TOP + 4 * LINE_SP
-        bx = 8
-        pygame.draw.line(self.surf, BRACE_C, (bx, y0), (bx, y1), 3)
-        pygame.draw.line(self.surf, BRACE_C, (bx, y0), (bx + 10, y0), 3)
-        pygame.draw.line(self.surf, BRACE_C, (bx, y1), (bx + 10, y1), 3)
+                if acc and xi > CLEF_W - 40:
+                    if acc == '#':
+                        s = self._sharp_surf
+                    else:
+                        s = self._flat_surf
+                    ax = xi - NOTE_W - s.get_width() - 2
+                    ay = yi - s.get_height() // 2
+                    self.surf.blit(s, (ax, ay))
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -640,36 +742,21 @@ class App:
                 if self.btn_stop.pressed:
                     self._stop()
 
-            # ── render ────────────────────────────────────────────────────────
-            self.surf.fill(BG)
+            # ── render ────────────────────────────────────────────────────
+            # Blit the static background (staves, clefs, brace)
+            self.surf.blit(self._staff_surf, (0, 0))
 
-            # clef background strip (left of play line)
-            top_y0 = TREBLE_TOP - 60
-            bot_y1 = BASS_TOP + 4 * LINE_SP + 60
-            pygame.draw.rect(self.surf, CLEF_BG,
-                             (0, top_y0, CLEF_W, bot_y1 - top_y0))
-            pygame.draw.line(self.surf, LGRAY,
-                             (CLEF_W, top_y0), (CLEF_W, bot_y1), 1)
-
-            # staves (extend into clef area for the lines)
-            self._draw_staff(TREBLE_TOP)
-            self._draw_staff(BASS_TOP)
-
-            # brace & clef symbols
-            self._draw_brace()
-            self._draw_clefs()
-
-            # play line
+            # Play line
             pygame.draw.line(self.surf, PLAY_C,
-                             (PLAY_X, TREBLE_TOP - 55),
-                             (PLAY_X, BASS_TOP + 4 * LINE_SP + 55), 2)
+                             (PLAY_X, TREBLE_TOP - 3 * LINE_SP),
+                             (PLAY_X, BASS_TOP + STAFF_H + 3 * LINE_SP), 2)
 
-            # notes
-            la = self.sld.val
+            # Animated notes
+            la  = self.sld.val
             src = self.live.get_notes() if self.mode == 'live' else self.notes
-            self._draw_notes(src, la)
+            self._draw_notes(src, la, is_live=(self.mode == 'live'))
 
-            # ── control panel ─────────────────────────────────────────────────
+            # ── control panel ─────────────────────────────────────────────
             pygame.draw.rect(self.surf, CTRL_BG, (0, CTRL_Y, W, H - CTRL_Y))
             pygame.draw.line(self.surf, LGRAY, (0, CTRL_Y), (W, CTRL_Y), 1)
 
@@ -678,22 +765,17 @@ class App:
                 self.btn_load.draw(self.surf, self.uf)
                 self.btn_play.draw(self.surf, self.uf)
                 self.btn_stop.draw(self.surf, self.uf)
-
             self.sld.draw(self.surf, self.uf)
 
-            # status + time
-            self.surf.blit(self.sf.render(self.status, True, DARK),
-                           (600, CTRL_Y + 12))
-            ts = f't = {self.cur_t:.1f}s'
-            self.surf.blit(self.sf.render(ts, True, DARK), (W - 130, CTRL_Y + 12))
-            hints = 'Space: play/pause    R: restart'
-            self.surf.blit(self.sf.render(hints, True, LGRAY), (600, CTRL_Y + 34))
+            self.surf.blit(self.sf.render(self.status, True, DARK), (600, CTRL_Y + 12))
+            self.surf.blit(self.sf.render(f't = {self.cur_t:.1f}s', True, DARK),
+                           (W - 130, CTRL_Y + 12))
+            self.surf.blit(self.sf.render('Space: play/pause    R: restart', True, LGRAY),
+                           (600, CTRL_Y + 34))
 
-            # mode indicator
-            mode_lbl = ('● LIVE' if self.mode == 'live' else '● FILE')
-            mode_col  = (210, 50, 50) if self.mode == 'live' else (50, 130, 50)
-            self.surf.blit(self.uf.render(mode_lbl, True, mode_col),
-                           (600, CTRL_Y + 56))
+            mode_lbl = '● LIVE' if self.mode == 'live' else '● FILE'
+            mode_col = (200, 40, 40) if self.mode == 'live' else (40, 130, 40)
+            self.surf.blit(self.uf.render(mode_lbl, True, mode_col), (600, CTRL_Y + 56))
 
             pygame.display.flip()
 
